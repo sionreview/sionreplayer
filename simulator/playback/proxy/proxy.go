@@ -6,22 +6,21 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sionreview/sion/common/util/promise"
+	"github.com/mason-leap-lab/go-utils/logger"
+	"github.com/mason-leap-lab/go-utils/promise"
 	"github.com/sionreview/sionreplayer/simulator/readers"
 	"github.com/zhangjyr/hashmap"
 )
 
-const (
-	SLICE_SIZE = 100
-)
-
 var (
-	FunctionOverhead uint64 = 100
+	FunctionOverhead uint64 = 250
 	FunctionCapacity uint64 = 1536
 
 	ErrNoPlacementsTest  = errors.New("set placements before get placements first")
 	ErrPlacementsCleared = errors.New("placements cleared")
 	ErrPlacementsUnset   = errors.New("placements unset")
+
+	log logger.Logger = logger.NilLogger
 )
 
 type Chunk struct {
@@ -127,8 +126,9 @@ type Proxy struct {
 	Balancer     ProxyBalancer
 	BalancerCost time.Duration
 
-	evicts     *hashmap.HashMap // map[string]*Chunk
-	placements *hashmap.HashMap // map[string][]int
+	evicts     *hashmap.HashMap // map[string]*Chunk, evicted chunks
+	placements *hashmap.HashMap // map[string][]int, placements of keys
+	cleared    *hashmap.HashMap // map[string]bool, cleared keys
 	mu         sync.Mutex
 }
 
@@ -139,6 +139,7 @@ func NewProxy(id string, numCluster int, balancer ProxyBalancer) *Proxy {
 		Balancer:   balancer,
 		placements: hashmap.New(1024),
 		evicts:     hashmap.New(1024),
+		cleared:    hashmap.New(1024),
 	}
 	for i := 0; i < len(proxy.LambdaPool); i++ {
 		proxy.LambdaPool[i] = NewLambda(uint64(i))
@@ -148,6 +149,10 @@ func NewProxy(id string, numCluster int, balancer ProxyBalancer) *Proxy {
 		balancer.Init()
 	}
 	return proxy
+}
+
+func (p *Proxy) Len() int {
+	return len(p.LambdaPool)
 }
 
 func (p *Proxy) ValidateLambda(lambdaId uint64) {
@@ -201,18 +206,22 @@ func (p *Proxy) Validate(obj *Object) bool {
 	return p.Balancer.Validate(obj)
 }
 
-func (p *Proxy) IsSet(key string) bool {
-	_, ok := p.placements.Get(key)
-	return ok
-}
-
-func (p *Proxy) Placements(key string) []uint64 {
+// Placements returns the placements of the object, if the placements not available, blocks and returns
+// until the placements are available. The function is thread-safe by blocks concurrent calls that may
+// create a new placement.
+// Returns (placements, seen). If placements are nil, SetPlacements or ResetPlacements must be called
+// to unlock blocked calls.
+func (p *Proxy) Placements(key string) ([]uint64, bool) {
 	// A successful insertion can proceed, or it should wait.
 	if v, ok := p.placements.GetOrInsert(key, promise.NewPromise()); !ok {
-		return nil
+		if _, cleared := p.cleared.Get(key); cleared {
+			return nil, true
+		} else {
+			return nil, false
+		}
 	} else {
 		if ret, err := v.(promise.Promise).Result(); err == nil {
-			return ret.([]uint64)
+			return ret.([]uint64), true
 		} else {
 			// Placements cleared, retry.
 			return p.Placements(key)
@@ -232,16 +241,19 @@ func (p *Proxy) SetPlacements(key string, placements []uint64) error {
 func (p *Proxy) ResetPlacements(key string, placements []uint64) error {
 	if v, ok := p.placements.Get(key); !ok {
 		return ErrNoPlacementsTest
-	} else if !v.(promise.Promise).IsResolved() {
-		return ErrPlacementsUnset
+	} else if v.(promise.Promise).IsResolved() {
+		ret := promise.Resolved(placements)
+		p.placements.Set(key, ret)
+		return nil
+	} else {
+		p.cleared.Del(key)
+		v.(promise.Promise).Resolve(placements)
+		return nil
 	}
-
-	ret := promise.Resolved(placements)
-	p.placements.Set(key, ret)
-	return nil
 }
 
 func (p *Proxy) ClearPlacements(key string) {
+	p.cleared.Set(key, true)
 	v, ok := p.placements.Get(key)
 	p.placements.Del(key)
 	if ok && !v.(promise.Promise).IsResolved() {
@@ -250,6 +262,7 @@ func (p *Proxy) ClearPlacements(key string) {
 }
 
 func (p *Proxy) Evict(key string, chunk *Chunk) {
+	log.Debug("evicting %s", key)
 	p.evicts.Set(key, chunk)
 }
 
@@ -259,6 +272,9 @@ func (p *Proxy) GetEvicted(key string) *Chunk {
 	} else {
 		return nil
 	}
+}
+func (p *Proxy) NumEvicts() int {
+	return p.evicts.Len()
 }
 
 func (p *Proxy) AllEvicts() <-chan hashmap.KeyValue {

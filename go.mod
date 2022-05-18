@@ -11,6 +11,6 @@ require (
 	github.com/go-redis/redis/v8 v8.11.4
 	github.com/google/uuid v1.2.0
 	github.com/mason-leap-lab/go-utils v1.2.2
-	github.com/sionreview/sion v0.0.0-20220112225628-fad0afb4aed6
+	github.com/sionreview/sion v0.0.0-20220518023251-801b93fcf0db // indirect
 	github.com/zhangjyr/hashmap v1.0.2
 )

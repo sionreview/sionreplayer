@@ -2,8 +2,6 @@ package proxy
 
 import (
 	"container/heap"
-	"fmt"
-	"log"
 )
 
 // A PriorityQueue implements heap.Interface and holds Items.
@@ -72,18 +70,18 @@ func (b *PriorityBalancer) Adapt(lambdaId uint64, _ *Chunk) {
 	// b.dump()
 }
 
-func (b *PriorityBalancer) dump() {
-	msg := "[%d:%d]%s"
-	for _, lambda := range b.minority {
-		msg = fmt.Sprintf(msg, lambda.Id, lambda.MemUsed, ",[%d:%d]%s")
-	}
-	log.Printf(msg, 0, 0, "\n")
-}
+// func (b *PriorityBalancer) dump() {
+// 	msg := "[%d:%d]%s"
+// 	for _, lambda := range b.minority {
+// 		msg = fmt.Sprintf(msg, lambda.Id, lambda.MemUsed, ",[%d:%d]%s")
+// 	}
+// 	log.Debug(msg, 0, 0, "\n")
+// }
 
 func (b *PriorityBalancer) Validate(*Object) bool {
 	return true
 }
 
 func (b *PriorityBalancer) Close() {
-	log.Println("close")
+	log.Debug("close")
 }

@@ -1,6 +1,7 @@
 package benchclient
 
 import (
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -8,9 +9,30 @@ import (
 	"github.com/sionreview/sion/common/logger"
 )
 
+const (
+	ResultSuccess  = 0
+	ResultError    = 1
+	ResultNotFound = 2
+)
+
+func resultFromError(err error) int {
+	switch err {
+	case nil:
+		return ResultSuccess
+	case sion.ErrNotFound:
+		return ResultNotFound
+	default:
+		return ResultError
+	}
+}
+
+var (
+	ErrNotSupported = errors.New("not supported")
+)
+
 type Client interface {
-	EcSet(string, []byte, ...interface{}) (string, bool)
-	EcGet(string, ...interface{}) (string, sion.ReadAllCloser, bool)
+	EcSet(string, []byte, ...interface{}) (string, error)
+	EcGet(string, ...interface{}) (string, sion.ReadAllCloser, error)
 	Close()
 }
 
@@ -21,6 +43,7 @@ type defaultClient struct {
 	log    logger.ILogger
 	setter clientSetter
 	getter clientGetter
+	abbr   string // Abbreviation for logging
 }
 
 func newDefaultClient(logPrefix string) *defaultClient {
@@ -37,10 +60,11 @@ func newDefaultClientWithAccessor(logPrefix string, setter clientSetter, getter 
 		},
 		setter: setter,
 		getter: getter,
+		abbr:   "na",
 	}
 }
 
-func (c *defaultClient) EcSet(key string, val []byte, args ...interface{}) (string, bool) {
+func (c *defaultClient) EcSet(key string, val []byte, args ...interface{}) (string, error) {
 	reqId := uuid.New().String()
 
 	// Debuging options
@@ -49,24 +73,27 @@ func (c *defaultClient) EcSet(key string, val []byte, args ...interface{}) (stri
 		dryrun, _ = args[0].(int)
 	}
 	if dryrun > 0 {
-		return reqId, true
+		return reqId, nil
 	}
 
 	if c.setter == nil {
-		return reqId, false
+		return reqId, ErrNotSupported
 	}
 
 	// Timing
 	start := time.Now()
-	if err := c.setter(key, val); err != nil {
-		c.log.Error("failed to upload: %v", err)
-		return reqId, false
+	err := c.setter(key, val)
+	duration := time.Since(start)
+	nanoLog(logClient, "set", key, start.UnixNano(), duration.Nanoseconds(), len(val), resultFromError(err), c.abbr)
+	if err != nil {
+		c.log.Error("Failed to upload: %v", err)
+		return reqId, err
 	}
-	c.log.Info("Set %s %d", key, int64(time.Since(start)))
-	return reqId, true
+	c.log.Info("Set %s %v %d", key, duration, len(val))
+	return reqId, nil
 }
 
-func (c *defaultClient) EcGet(key string, args ...interface{}) (string, sion.ReadAllCloser, bool) {
+func (c *defaultClient) EcGet(key string, args ...interface{}) (string, sion.ReadAllCloser, error) {
 	reqId := uuid.New().String()
 
 	var dryrun int
@@ -74,23 +101,28 @@ func (c *defaultClient) EcGet(key string, args ...interface{}) (string, sion.Rea
 		dryrun, _ = args[0].(int)
 	}
 	if dryrun > 0 {
-		return reqId, nil, true
+		return reqId, nil, nil
 	}
 
 	if c.getter == nil {
-		return reqId, nil, false
+		return reqId, nil, ErrNotSupported
 	}
 
 	// Timing
 	start := time.Now()
 	reader, err := c.getter(key)
+	duration := time.Since(start)
+	size := 0
+	if reader != nil {
+		size = reader.Len()
+	}
+	nanoLog(logClient, "get", key, start.UnixNano(), duration.Nanoseconds(), size, resultFromError(err), c.abbr)
 	if err != nil {
 		c.log.Error("failed to download: %v", err)
-		return reqId, nil, false
+		return reqId, nil, err
 	}
-	c.log.Info("Get %s %d", key, int64(time.Since(start)))
-
-	return reqId, reader, true
+	c.log.Info("Get %s %v %d", key, duration, size)
+	return reqId, reader, nil
 }
 
 func (c *defaultClient) Close() {

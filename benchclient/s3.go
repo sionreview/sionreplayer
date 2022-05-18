@@ -7,7 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	infinicache "github.com/sionreview/sion/client"
+	sion "github.com/sionreview/sion/client"
 )
 
 var (
@@ -34,6 +34,7 @@ func NewS3(bk string) *S3 {
 	}
 	client.setter = client.set
 	client.getter = client.get
+	client.abbr = "s3"
 	return client
 }
 
@@ -47,7 +48,7 @@ func (c *S3) set(key string, val []byte) error {
 	return err
 }
 
-func (c *S3) get(key string) (infinicache.ReadAllCloser, error) {
+func (c *S3) get(key string) (sion.ReadAllCloser, error) {
 	buff := new(aws.WriteAtBuffer)
 	_, err := c.downloader.Download(buff, &s3.GetObjectInput{
 		Bucket: aws.String(c.bucket),

@@ -34,7 +34,7 @@ func (lru *LRUPlacer) Init() {
 	group := cluster.NewGroup(numCluster)
 	for i := group.StartIndex(); i < group.EndIndex(); i = i.Next() {
 		ins := lambdastore.NewInstance("SimInstance", uint64(i))
-		// Update capacity, overhead should be consistent between infinicache configuration and simulator.
+		// Update capacity, overhead should be consistent between sion configuration and simulator.
 		ins.Meta.ResetCapacity(lru.proxy.LambdaPool[i].Capacity, lru.proxy.LambdaPool[i].MemUsed)
 		group.Set(group.Reserve(i, ins))
 	}
@@ -66,7 +66,7 @@ func (lru *LRUPlacer) Remap(placements []uint64, obj *Object) []uint64 {
 
 				remapped.Done()
 			}
-		}(lru.backend.NewMeta(obj.Key, strconv.FormatUint(obj.Size, 10), obj.DChunks, obj.PChunks, i, int64(obj.ChunkSz), uint64(placements[i]), SLICE_SIZE))
+		}(lru.backend.NewMeta(obj.Key, strconv.FormatUint(obj.Size, 10), obj.DChunks, obj.PChunks, i, int64(obj.ChunkSz), uint64(placements[i]), lru.proxy.Len()))
 	}
 
 	remapped.Wait()
@@ -105,12 +105,11 @@ func (lru *LRUPlacer) simServe(incomes chan interface{}, done *sync.WaitGroup) {
 }
 
 func (lru *LRUPlacer) dropEvicted(meta *metastore.Meta) {
-	// delete(lru.proxy.Placements, meta.Key)
+	lru.proxy.ClearPlacements(meta.Key)
 	for i, lambdaId := range meta.Placement {
 		chk, ok := lru.proxy.LambdaPool[lambdaId].DelChunk(fmt.Sprintf("%d@%s", i, meta.Key))
 		if ok {
 			lru.proxy.Evict(chk.Key, chk)
-			lru.proxy.ClearPlacements(meta.Key)
 		}
 	}
 }

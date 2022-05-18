@@ -41,8 +41,8 @@ import (
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash"
 	"github.com/dustin/go-humanize"
+	"github.com/mason-leap-lab/go-utils/logger"
 	"github.com/sionreview/sion/client"
-	"github.com/sionreview/sion/common/logger"
 	"github.com/sionreview/sion/proxy/global"
 	"github.com/sionreview/sionreplayer/benchclient"
 
@@ -54,6 +54,10 @@ import (
 const (
 	TIME_PATTERN  = "2006-01-02 15:04:05.000"
 	TIME_PATTERN2 = "2006-01-02 15:04:05"
+
+	PerformResultSuccess  = 0
+	PerformResultError    = 1
+	PerformResultNotFound = 2
 )
 
 var (
@@ -62,8 +66,10 @@ var (
 		Level:   logger.LOG_LEVEL_ALL,
 		Color:   true,
 	}
-	clients    *proxy.Pool
-	numClients int32
+	clientPools               []*proxy.Pool
+	numClients                int32
+	keySets, keyGets, keyMiss int32
+	sets, gets                int32
 )
 
 func init() {
@@ -93,7 +99,9 @@ type Options struct {
 	Skip             int64
 	S3               string
 	Redis            string
-	RedisCluster     bool
+	RedisCluster     int
+	Dummy            bool
+	Failover         string
 	Balance          bool
 	Concurrency      int
 	Bandwidth        int64
@@ -103,6 +111,8 @@ type Options struct {
 	FunctionCapacity uint64
 	FunctionOverhead uint64
 }
+
+type NanoLogProvider func(func(nanolog.Handle, ...interface{}) error)
 
 type FinalizeOptions struct {
 	once         sync.Once
@@ -123,10 +133,10 @@ func (h hasher) Sum64(data []byte) uint64 {
 	return xxhash.Sum64(data)
 }
 
-func perform(opts *Options, cli benchclient.Client, p *proxy.Proxy, obj *proxy.Object) (string, string) {
+func perform(opts *Options, cli benchclient.Client, p *proxy.Proxy, obj *proxy.Object) (string, string, int) {
 	dryrun := 0
 	if opts.Dryrun {
-		dryrun = proxy.SLICE_SIZE
+		dryrun = opts.Cluster
 		if !opts.Compact && obj.Estimation > time.Duration(0) {
 			log.Debug("Sleep %v to simulate processing %s: ", obj.Estimation, obj.Key)
 			time.Sleep(obj.Estimation)
@@ -134,64 +144,102 @@ func perform(opts *Options, cli benchclient.Client, p *proxy.Proxy, obj *proxy.O
 	}
 
 	// log.Debug("Key:", obj.Key, "mapped to Proxy:", p.Id)
-	if placements := p.Placements(obj.Key); placements != nil {
-		log.Trace("Found placements of %v: %v", obj.Key, placements)
+	if placements, seen := p.Placements(obj.Key); seen {
+		atomic.AddInt32(&gets, 1)
+		// placements can only be empty if dryrun is true and specific balancer is used (e.g., proxy.LRUPlacer)
+		if placements != nil {
+			log.Trace("Found placements of %v: %v", obj.Key, placements)
+		}
 
-		reqId, reader, _ := cli.EcGet(obj.Key, dryrun)
-		// if opts.Dryrun && opts.Balance {
-		// 	success = p.Validate(obj)
-		// }
+		reqId, reader, err := cli.EcGet(obj.Key, dryrun)
+		if opts.Dryrun && opts.Balance {
+			// Validate the result on dryrun.
+			success := placements != nil && p.Validate(obj)
+			if !success {
+				err = client.ErrNotFound
+				log.Warn("Not found due to eviction: %v", obj.Key)
+			}
+		}
 
-		// if !success {
-		// 	val := make([]byte, obj.Size)
-		// 	rand.Read(val)
-		// 	resetPlacements32 := make([]int, opts.Datashard+opts.Parityshard)
-		// 	for i := 0; i < len(placements); i++ {
-		// 		resetPlacements32[i] = int(placements[i])
-		// 	}
-		// 	_, reset := cli.EcSet(obj.Key, val, dryrun, resetPlacements32, "Reset")
-		// 	// Reset is designed for caching system in normal(playback) mode.
-		// 	// Only one of concurrent Reset requests is expected to success.
-		// 	if reset {
-		// 		log.Trace("Reset %s.", obj.Key)
+		if err == client.ErrNotFound {
+			atomic.AddInt32(&keyMiss, 1)
+			var val []byte
+			if len(clientPools) > 1 {
+				cli := clientPools[1].Get().(benchclient.Client)
+				_, reader, _ := cli.EcGet(obj.Key, dryrun)
+				if reader != nil {
+					val, _ = reader.ReadAll()
+					reader.Close()
+				}
+				clientPools[1].Put(cli)
+			}
 
-		// 		displaced := false
-		// 		resetPlacements64 := make([]uint64, opts.Datashard+opts.Parityshard)
-		// 		for i := 0; i < len(resetPlacements32); i++ {
-		// 			resetPlacements64[i] = uint64(resetPlacements32[i])
-		// 		}
-		// 		resetPlacements := p.Remap(resetPlacements64, obj)
-		// 		for i, idx := range resetPlacements {
-		// 			p.ValidateLambda(idx)
-		// 			chk, _ := p.LambdaPool[placements[i]].GetChunk(fmt.Sprintf("%d@%s", i, obj.Key))
-		// 			if chk == nil {
-		// 				// Eviction tracked by simulator. Try find chunk from evicts.
-		// 				chk = p.GetEvicted(fmt.Sprintf("%d@%s", i, obj.Key))
-		// 				displaced = true
-		// 			} else if idx != placements[i] {
-		// 				// Placement changed?
-		// 				displaced = true
-		// 				log.Warn("Placement changed on reset %s, %d -> %d", chk.Key, placements[i], idx)
-		// 				p.LambdaPool[placements[i]].DelChunk(chk.Key)
-		// 			}
-		// 			if chk == nil {
-		// 				// Unlikely, but just in case
-		// 				log.Warn("Failed to track chunk %d@%s on resetting", i, obj.Key)
-		// 			} else {
-		// 				p.LambdaPool[idx].AddChunk(chk)
-		// 				chk.Reset++
-		// 			}
-		// 			p.LambdaPool[idx].Activate(obj.Timestamp)
-		// 		}
-		// 		if displaced {
-		// 			p.ResetPlacements(obj.Key, resetPlacements)
-		// 		}
-		// 	}
-		// 	return "get", reqId
-		// } else
-		if reader != nil {
+			if val == nil && !opts.Lean {
+				log.Warn("Regenerate %d bytes object", obj.Size)
+				val = make([]byte, obj.Size)
+				rand.Read(val)
+			}
+			resetPlacements32 := make([]int, opts.Datashard+opts.Parityshard)
+			for i := 0; i < len(placements); i++ {
+				resetPlacements32[i] = int(placements[i])
+			}
+			_, err := cli.EcSet(obj.Key, val, dryrun, resetPlacements32, "Reset")
+			// Reset is designed for caching system in normal(playback) mode.
+			// Only one of concurrent Reset requests is expected to success.
+			if err == nil {
+				log.Trace("Reset %s.", obj.Key)
+
+				displaced := false
+				resetPlacements64 := make([]uint64, opts.Datashard+opts.Parityshard)
+				for i := 0; i < len(resetPlacements32); i++ {
+					resetPlacements64[i] = uint64(resetPlacements32[i])
+				}
+				resetPlacements := p.Remap(resetPlacements64, obj)
+				for i, idx := range resetPlacements {
+					p.ValidateLambda(idx)
+					add := false
+					var chk *proxy.Chunk
+					if placements != nil {
+						chk, _ = p.LambdaPool[placements[i]].GetChunk(fmt.Sprintf("%d@%s", i, obj.Key))
+					}
+
+					if chk == nil {
+						// Eviction tracked by simulator. Try find chunk from evicts.
+						chk = p.GetEvicted(fmt.Sprintf("%d@%s", i, obj.Key))
+						displaced = true
+						add = true
+					} else if placements != nil && idx != placements[i] {
+						// Placement changed?
+						displaced = true
+						log.Warn("Placement changed on reset %s, %d -> %d", chk.Key, placements[i], idx)
+						p.LambdaPool[placements[i]].DelChunk(chk.Key)
+						add = true
+					}
+
+					if chk == nil {
+						// Unlikely, but just in case
+						log.Warn("Failed to track chunk %d@%s on resetting", i, obj.Key)
+					} else if add {
+						p.LambdaPool[idx].AddChunk(chk)
+						chk.Reset++
+					} else {
+						chk.Reset++
+					}
+					p.LambdaPool[idx].Activate(obj.Timestamp)
+				}
+				if displaced {
+					p.ResetPlacements(obj.Key, resetPlacements)
+				}
+			}
+			return "get", reqId, PerformResultNotFound
+		} else if reader != nil {
 			reader.Close()
 		}
+		if err != nil {
+			return "get", reqId, PerformResultError
+		}
+
+		atomic.AddInt32(&keyGets, 1)
 		log.Trace("Get %s.", obj.Key)
 
 		for i, idx := range placements {
@@ -203,7 +251,7 @@ func perform(opts *Options, cli benchclient.Client, p *proxy.Proxy, obj *proxy.O
 			chk.Freq++
 			p.LambdaPool[idx].Activate(obj.Timestamp)
 		}
-		return "get", reqId
+		return "get", reqId, PerformResultSuccess
 	} else {
 		log.Trace("No placements found: %v", obj.Key)
 
@@ -216,10 +264,18 @@ func perform(opts *Options, cli benchclient.Client, p *proxy.Proxy, obj *proxy.O
 		}
 		placements32 := make([]int, opts.Datashard+opts.Parityshard)
 		placements := make([]uint64, len(placements32))
-		reqId, success := cli.EcSet(obj.Key, val, dryrun, placements32, "Normal")
-		if !success {
+		if len(clientPools) > 1 {
+			go func(key string, val []byte) {
+				cli := clientPools[1].Get().(benchclient.Client)
+				cli.EcSet(key, val, dryrun)
+				clientPools[1].Put(cli)
+			}(obj.Key, val)
+		}
+		atomic.AddInt32(&sets, 1)
+		reqId, err := cli.EcSet(obj.Key, val, dryrun, placements32, "Normal")
+		if err != nil {
 			p.ClearPlacements(obj.Key)
-			return "set", reqId
+			return "set", reqId, PerformResultError
 		}
 		for i := 0; i < len(placements32); i++ {
 			placements[i] = uint64(placements32[i])
@@ -245,7 +301,8 @@ func perform(opts *Options, cli benchclient.Client, p *proxy.Proxy, obj *proxy.O
 		}
 		log.Trace("Set %s, placements: %v.", obj.Key, placements)
 		p.SetPlacements(obj.Key, placements)
-		return "set", reqId
+		atomic.AddInt32(&keySets, 1)
+		return "set", reqId, PerformResultSuccess
 	}
 }
 
@@ -284,7 +341,7 @@ func helpInfo(flag *sysflag.FlagSet) {
 }
 
 func main() {
-	flag := &sysflag.FlagSet{}
+	flag := sysflag.NewFlagSet("defaut", sysflag.ContinueOnError)
 
 	var printInfo bool
 	flag.BoolVar(&printInfo, "h", false, "help info?")
@@ -311,8 +368,10 @@ func main() {
 	flag.Int64Var(&options.LimitHour, "limitHour", 0, "limit to play N hours only")
 	flag.Int64Var(&options.Skip, "skip", 0, "skip N records")
 	flag.StringVar(&options.S3, "s3", "", "s3 bucket for enable s3 simulation")
-	flag.StringVar(&options.Redis, "redis", "", "Redis for enable Redis simulation")
-	flag.BoolVar(&options.RedisCluster, "redisCluster", false, "redisCluster for enable Redis simulation")
+	flag.StringVar(&options.Redis, "redis", "", "Redis address for enable Redis simulation")
+	flag.IntVar(&options.RedisCluster, "redisCluster", 1, "The number of nodes in the redis cluster. Set larger than 1 to enable Redis cluster")
+	flag.BoolVar(&options.Dummy, "dummy", false, "using Dummy client for simulation")
+	flag.StringVar(&options.Failover, "failover", "", "specify the failover service in case the main service failed. The failover service can be s3 and must be enabled in parameters.")
 	flag.BoolVar(&options.Balance, "balance", false, "enable balancer on dryrun")
 	flag.IntVar(&options.Concurrency, "c", 100, "max concurrency allowed, minimum 1.")
 	flag.Int64Var(&options.Bandwidth, "w", 0, "unit bandwidth per shard in MiB/s. 0 for unlimited bandwidth")
@@ -350,12 +409,6 @@ func main() {
 		log.Verbose = false
 		log.Level = logger.LOG_LEVEL_WARN
 	}
-	if options.File != "" {
-		if err := logCreate(options); err != nil {
-			panic(err)
-		}
-		finalizeOptions.closeNanolog = true
-	}
 	if options.Concurrency <= 0 {
 		options.Concurrency = 1
 	}
@@ -374,30 +427,65 @@ func main() {
 	}
 	finalizeOptions.traceFile = traceFile
 
+	nanologProvider := benchclient.SetLogger
 	addrArr := strings.Split(options.AddrList, ",")
 	proxies, ring := initProxies(len(addrArr), options)
-	clients = proxy.InitPool(&proxy.Pool{
-		New: func() interface{} {
-			atomic.AddInt32(&numClients, 1)
-			var cli benchclient.Client
-			if options.S3 != "" {
-				cli = benchclient.NewS3(options.S3)
-			} else if options.Redis != "" {
-				cli = benchclient.NewRedis(options.Redis)
-			} else if options.RedisCluster {
-				cli = benchclient.NewElasticCache()
-			} else {
-				cli = client.NewClient(options.Datashard, options.Parityshard, options.ECmaxgoroutine)
-				if !options.Dryrun {
-					cli.(*client.Client).Dial(addrArr)
-				}
-			}
-			return cli
-		},
-		Finalize: func(c interface{}) {
-			c.(benchclient.Client).Close()
-		},
-	}, options.Concurrency, proxy.PoolForStrictConcurrency)
+	if options.Dummy {
+		benchclient.ResetDummySizeRegistry()
+	}
+	clientProviders := BuildClientProviders(options)
+	clientPools = make([]*proxy.Pool, 1, 2)
+	// Initiate failover client pool
+	if options.Failover != "" {
+		provider, ok := clientProviders[strings.ToLower(options.Failover)]
+		if !ok {
+			log.Error("Failover client specified but not enabled: %s", strings.ToLower(options.Failover))
+			os.Exit(1)
+			return
+		}
+		clientPools = append(clientPools, proxy.InitPool(&proxy.Pool{
+			New: func() interface{} {
+				// Only count the main pool.
+				// atomic.AddInt32(&numClients, 1)
+				return provider()
+			},
+			Finalize: func(c interface{}) {
+				c.(benchclient.Client).Close()
+			},
+		}, options.Concurrency, proxy.PoolForStrictConcurrency))
+		delete(clientProviders, strings.ToLower(options.Failover))
+
+		if options.Failover == ProviderDummy {
+			clientProviders[ProviderDummy] = GenDummyClientProvider(options.Bandwidth, benchclient.DummyCache)
+		}
+	}
+	// Ensure main client pool exists.
+	if len(clientProviders) == 0 {
+		clientProviders[ProviderDefault] = GenDefaultClientProvider(options)
+	}
+	// Initiate main client pool
+	for key, provider := range clientProviders {
+		clientPools[0] = proxy.InitPool(&proxy.Pool{
+			New: func() interface{} {
+				atomic.AddInt32(&numClients, 1)
+				return provider()
+			},
+			Finalize: func(c interface{}) {
+				c.(benchclient.Client).Close()
+			},
+		}, options.Concurrency, proxy.PoolForStrictConcurrency)
+		if key == ProviderDefault {
+			nanologProvider = client.SetLogger
+		}
+		break
+	}
+
+	if options.File != "" {
+		if err := logCreate(options, nanologProvider); err != nil {
+			panic(err)
+		}
+		finalizeOptions.closeNanolog = true
+	}
 
 	var reader readers.RecordReader
 	switch strings.ToLower(options.TraceName) {
@@ -575,7 +663,7 @@ func main() {
 			// for options.Concurrency > 0 && atomic.LoadInt32(&concurrency) >= int32(options.Concurrency) {
 			// 	cond.Wait()
 			// }
-			cli := clients.Get().(benchclient.Client)
+			cli := clientPools[0].Get().(benchclient.Client)
 
 			// Start perform
 			var notifier *helpers.TimeSkipNotification
@@ -601,8 +689,8 @@ func main() {
 				actural := skippedDuration + time.Since(start)
 				log.Info("%d(c:%d) Playbacking %v %s (expc %v, schd %v, actc %v)...", sn, c, obj.Key, humanize.Bytes(obj.Size), expected, scheduled, actural)
 
-				_, reqId := perform(options, cli, p, obj)
-				clients.Put(cli)
+				_, reqId, _ := perform(options, cli, p, obj)
+				clientPools[0].Put(cli)
 				if notifier != nil {
 					notifier.Wait()
 					// log.Debug("Skipped %d:%s", sn, obj.Key)
@@ -639,9 +727,9 @@ func main() {
 	minMem := float64(10000000000000)
 	maxChunks := float64(0)
 	minChunks := float64(1000)
-	set := 0
-	got := uint64(0)
-	reset := uint64(0)
+	setChunks := 0
+	gotChunks := uint64(0)
+	resetChunks := uint64(0)
 	activated := 0
 	var balancerCost time.Duration
 	for i := 0; i < len(proxies); i++ {
@@ -653,16 +741,17 @@ func main() {
 			maxMem = math.Max(maxMem, float64(lambda.MemUsed))
 			minChunks = math.Min(minChunks, float64(lambda.NumChunks()))
 			maxChunks = math.Max(maxChunks, float64(lambda.NumChunks()))
-			set += lambda.NumChunks()
+			setChunks += lambda.NumChunks()
 			for chk := range lambda.AllChunks() {
-				got += chk.Value.(*proxy.Chunk).Freq
-				reset += chk.Value.(*proxy.Chunk).Reset
+				gotChunks += chk.Value.(*proxy.Chunk).Freq
+				resetChunks += chk.Value.(*proxy.Chunk).Reset
 			}
 			activated += lambda.ActiveMinutes
 		}
+		setChunks += prxy.NumEvicts()
 		for chk := range prxy.AllEvicts() {
-			got += chk.Value.(*proxy.Chunk).Freq
-			reset += chk.Value.(*proxy.Chunk).Reset
+			gotChunks += chk.Value.(*proxy.Chunk).Freq
+			resetChunks += chk.Value.(*proxy.Chunk).Reset
 		}
 		balancerCost += prxy.BalancerCost
 		prxy.Close()
@@ -672,7 +761,9 @@ func main() {
 	syslog.Printf("Total memory consumed: %s\n", humanize.Bytes(uint64(totalMem)))
 	syslog.Printf("Memory consumed per lambda: %s - %s\n", humanize.Bytes(uint64(minMem)), humanize.Bytes(uint64(maxMem)))
 	syslog.Printf("Chunks per lambda: %d - %d\n", int(minChunks), int(maxChunks))
-	syslog.Printf("Set %d, Got %d, Reset %d\n", set, got, reset)
+	syslog.Printf("Chunks set %d, got %d, reset %d, hit ratio %d%%\n", setChunks, gotChunks, resetChunks, gotChunks*100/(gotChunks+resetChunks))
+	syslog.Printf("Puts total %d, succeeded %d\n", sets, keySets)
+	syslog.Printf("Gets total %d, succeeded %d, miss %d, hit ratio %d%%\n", gets, keyGets, keyMiss, keyGets*100/gets)
 	syslog.Printf("Active Minutes %d\n", activated)
 	syslog.Printf("BalancerCost: %s(%s per request)", balancerCost, balancerCost/time.Duration(read-options.Skip))
 	syslog.Printf("Max concurrency: %d, clients initialized: %d\n", maxConcurrency, atomic.LoadInt32(&numClients))
@@ -680,7 +771,9 @@ func main() {
 		syslog.Println(msg)
 	}
 
-	clients.Close()
+	for _, p := range clientPools {
+		p.Close()
+	}
 }
 
 func finalize(opts *FinalizeOptions) {
@@ -698,7 +791,7 @@ func finalize(opts *FinalizeOptions) {
 }
 
 //logCreate create the nanoLog
-func logCreate(opts *Options) error {
+func logCreate(opts *Options, setLogger NanoLogProvider) error {
 	// Set up nanoLog writer
 	path := opts.File + "_playback.clog"
 	nanoLogout, err := os.Create(path)
@@ -710,7 +803,7 @@ func logCreate(opts *Options) error {
 		return err
 	}
 
-	client.SetLogger(nanolog.Log)
+	setLogger(nanolog.Log)
 
 	return nil
 }

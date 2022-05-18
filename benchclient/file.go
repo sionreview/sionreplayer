@@ -1,10 +1,11 @@
 package benchclient
 
 import (
-	infinicache "github.com/sionreview/sion/client"
 	"io/ioutil"
 	"os"
 	"path"
+
+	sion "github.com/sionreview/sion/client"
 )
 
 type File struct {
@@ -19,6 +20,7 @@ func NewFile(provider string, path string) *File {
 	}
 	client.setter = client.set
 	client.getter = client.get
+	client.abbr = "f"
 	return client
 }
 
@@ -34,7 +36,7 @@ func (c *File) set(key string, val []byte) (err error) {
 	return
 }
 
-func (c *File) get(key string) (reader infinicache.ReadAllCloser, err error) {
+func (c *File) get(key string) (reader sion.ReadAllCloser, err error) {
 	var file *os.File
 	if file, err = os.OpenFile(path.Join(c.basePath, key), os.O_RDONLY, 0); err != nil {
 		return

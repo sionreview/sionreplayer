@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"log"
 	"math"
 )
 
@@ -79,5 +78,5 @@ func (b *WeightedBalancer) Validate(*Object) bool {
 }
 
 func (b *WeightedBalancer) Close() {
-	log.Println("close")
+	log.Debug("close")
 }
